@@ -268,6 +268,32 @@ jobs:
 
         continue-on-error: false
 
+      - name: Clean unnecessary files
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $outputDir = Join-Path $env:GITHUB_WORKSPACE "x64\Release\a"
+          $optiscalerDir = Join-Path $outputDir "OptiScaler"
+
+          $targets = @(
+            (Join-Path $outputDir "Licenses"),
+            (Join-Path $outputDir "!! EXTRACT ALL FILES TO GAME FOLDER !!"),
+            (Join-Path $outputDir "setup_linux.sh"),
+            (Join-Path $optiscalerDir "Streamlined_fetcher_windows.bat")
+          )
+
+          foreach ($target in $targets) {
+            if (Test-Path -LiteralPath $target) {
+              Remove-Item -LiteralPath $target -Recurse -Force
+              Write-Output "Removed: $target"
+            } else {
+              Write-Output "Not found, skipping: $target"
+            }
+          }
+
+          Write-Output "Cleanup completed."
+
       - name: Compress the artifact
         shell: powershell
         run: |
@@ -296,28 +322,85 @@ jobs:
 
         continue-on-error: false
 
+
       - name: Generate Changelog
         id: commit_messages
         working-directory: ${{ github.workspace }}
         shell: powershell
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_RUN_STARTED_AT: ${{ github.run_started_at }}
         run: |
-          Write-Output "Fetching commits from the last 24 hours..."
+          $ErrorActionPreference = "Stop"
 
+          # 获取本次构建开始时间（UTC）
+          $buildTime = [DateTimeOffset]::Parse(
+            $env:GITHUB_RUN_STARTED_AT
+          ).ToUniversalTime()
+
+          # 获取上一次成功发布的 Nightly Release
+          Write-Output "Fetching previous Nightly Release..."
+
+          $releases = gh release list `
+            --repo $env:GITHUB_REPOSITORY `
+            --limit 100 `
+            --json tagName,publishedAt |
+            ConvertFrom-Json
+
+          $previousRelease = $releases |
+            Where-Object {
+              $_.tagName -like "nightly-*" -and $_.publishedAt
+            } |
+            Sort-Object {
+              [DateTimeOffset]::Parse($_.publishedAt)
+            } -Descending |
+            Select-Object -First 1
+
+          if ($previousRelease) {
+            $startTime = [DateTimeOffset]::Parse(
+              $previousRelease.publishedAt
+            ).ToUniversalTime()
+
+            Write-Output "Previous Release: $($previousRelease.tagName)"
+          } else {
+            # 首次运行：回溯 7 天
+            $startTime = $buildTime.AddDays(-7)
+
+            Write-Output "No previous Nightly Release found."
+            Write-Output "Using a 7-day fallback window."
+          }
+
+          if ($startTime -ge $buildTime) {
+            throw "Invalid Changelog time range."
+          }
+
+          $startGit = $startTime.ToString("yyyy-MM-ddTHH:mm:ssZ")
+          $endGit = $buildTime.ToString("yyyy-MM-ddTHH:mm:ssZ")
+
+          Write-Output "Changelog Start: $startGit"
+          Write-Output "Changelog End: $endGit"
+
+          # 获取时间范围内的提交
           $fieldSep = [char]0x1F
           $recordSep = [char]0x1E
 
           $format = "%h${fieldSep}%H${fieldSep}%s${fieldSep}%b${fieldSep}%an${recordSep}"
 
           $rawLogLines = git log `
-            --since="1 day ago" `
+            "--since=$startGit" `
+            "--until=$endGit" `
             --no-merges `
             --first-parent `
-            --pretty=format:"$format"
+            "--pretty=format:$format"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to retrieve Git commit history."
+          }
 
           $rawLog = ($rawLogLines -join "`n")
 
           if (-not $rawLog) {
-            $releaseNotes = "No changes in the last 24 hours."
+            $releaseNotes = "No changes during this build period."
           } else {
             $records = $rawLog -split [regex]::Escape($recordSep) |
               Where-Object { $_.Trim() -ne "" }
@@ -348,12 +431,18 @@ jobs:
               $entry
             }
 
-            $releaseNotes = "### Changes in the Last 24 Hours`n`n" +
-              ($formattedCommits -join "`n`n")
+            if ($formattedCommits) {
+              $releaseNotes = "### Changes in Build Period`n`n" +
+                ($formattedCommits -join "`n`n")
+            } else {
+              $releaseNotes = "No changes during this build period."
+            }
           }
 
           $releaseNotes |
             Out-File -FilePath release_notes.md -Encoding utf8
+
+          Write-Output "Changelog generated successfully."
 
       - name: Create Release and Upload Artifact
         uses: softprops/action-gh-release@v2
