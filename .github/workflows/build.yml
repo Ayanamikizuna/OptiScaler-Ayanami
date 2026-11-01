@@ -1,0 +1,368 @@
+name: Scheduled Build
+
+on:
+  schedule:
+    - cron: '0 4 * * 2'
+    - cron: '0 4 * * 5'
+  workflow_dispatch:
+
+env:
+  SOLUTION_FILE_PATH: .
+  BUILD_CONFIGURATION: Release
+  MAIN_REPO: 'optiscaler/OptiScaler'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout Main Repository
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.MAIN_REPO }}
+          fetch-depth: 0
+          submodules: 'true'
+
+      - name: Extract OptiScaler Version
+        id: get_version
+        working-directory: ${{ github.workspace }}
+        shell: powershell
+        run: |
+          $resourceFile = ".\OptiScaler\resource.h"
+
+          if (-Not (Test-Path $resourceFile)) {
+            Write-Error "File not found: $resourceFile"
+            exit 1
+          }
+
+          function Get-Version-Component {
+            param (
+              [string]$pattern,
+              [string]$replacement
+            )
+
+            $line = Get-Content $resourceFile |
+              Select-String -Pattern $pattern |
+              Select-Object -First 1
+
+            if ($line) {
+              return ($line.Line -replace $replacement).Trim()
+            } else {
+              Write-Error "Pattern not found: $pattern"
+              exit 1
+            }
+          }
+
+          $majorVersion = Get-Version-Component 'VER_MAJOR_VERSION' '#define VER_MAJOR_VERSION\s+'
+          $minorVersion = Get-Version-Component 'VER_MINOR_VERSION' '#define VER_MINOR_VERSION\s+'
+          $hotfixVersion = Get-Version-Component 'VER_HOTFIX_VERSION' '#define VER_HOTFIX_VERSION\s+'
+          $buildVersion = Get-Version-Component 'VER_BUILD_NUMBER' '#define VER_BUILD_NUMBER\s+'
+
+          $version = "v$majorVersion.$minorVersion.$hotfixVersion-pre$buildVersion"
+          $date = Get-Date -Format "yyyyMMdd"
+          $outputFileName = "OptiScaler_${version}_${date}"
+          $releaseTag = "nightly-${date}"
+
+          Write-Output "Generated Filename: $outputFileName"
+          Write-Output "Generated Release Tag: $releaseTag"
+
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "filename=$outputFileName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "release_tag=$releaseTag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+        continue-on-error: false
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build
+        working-directory: ${{ github.workspace }}
+        run: msbuild /m /p:Configuration=${{ env.BUILD_CONFIGURATION }} ${{ env.SOLUTION_FILE_PATH }} /verbosity:minimal
+
+      - name: Download and Bundle dlssg-to-fsr3 DLL
+        id: fetch_dlssg
+        working-directory: ${{ github.workspace }}
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $downloadDir = Join-Path $env:GITHUB_WORKSPACE "dlssg-to-fsr3-download"
+          New-Item -ItemType Directory -Path $downloadDir -Force | Out-Null
+
+          Write-Output "Downloading latest release ZIP from optiscaler/dlssg-to-fsr3"
+
+          gh release download --repo optiscaler/dlssg-to-fsr3 --pattern "*.zip" --dir $downloadDir --clobber
+
+          $zipFile = Get-ChildItem -Path $downloadDir -Filter "*.zip" |
+            Select-Object -First 1
+
+          if (-not $zipFile) {
+            throw "No ZIP asset found in the latest dlssg-to-fsr3 release."
+          }
+
+          Write-Output "Downloaded: $($zipFile.Name)"
+
+          $extractPath = Join-Path $env:GITHUB_WORKSPACE "dlssg-to-fsr3-extracted"
+          Expand-Archive -LiteralPath $zipFile.FullName -DestinationPath $extractPath -Force
+
+          $dllName = "dlssg_to_fsr3_amd_is_better.dll"
+
+          $dllFile = Get-ChildItem -Path $extractPath -Filter $dllName -Recurse |
+            Select-Object -First 1
+
+          if (-not $dllFile) {
+            throw "$dllName was not found inside $($zipFile.Name)"
+          }
+
+          $destDir = Join-Path $env:GITHUB_WORKSPACE "x64\Release\a\OptiScaler"
+          New-Item -ItemType Directory -Path $destDir -Force | Out-Null
+
+          Copy-Item -LiteralPath $dllFile.FullName `
+            -Destination (Join-Path $destDir $dllName) -Force
+
+          Write-Output "Copied $dllName to $destDir"
+
+        continue-on-error: false
+
+      - name: Download latest Streamline DLLs
+        id: streamline
+        shell: powershell
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $workspace = $env:GITHUB_WORKSPACE
+          $downloadDir = Join-Path $workspace "streamline-download"
+          $extractDir = Join-Path $workspace "streamline-extracted"
+          $destDir = Join-Path $workspace "x64\Release\a\OptiScaler\streamline"
+
+          $headers = @{
+            "User-Agent" = "OptiScaler-Nightly-Build"
+            "Accept" = "application/vnd.github+json"
+          }
+
+          if ($env:GITHUB_TOKEN) {
+            $headers["Authorization"] = "Bearer $env:GITHUB_TOKEN"
+          }
+
+          New-Item -ItemType Directory -Path $downloadDir -Force | Out-Null
+
+          # Get the latest published stable release.
+          $release = Invoke-RestMethod `
+            -Uri "https://api.github.com/repos/NVIDIA-RTX/Streamline/releases/latest" `
+            -Headers $headers
+
+          if (-not $release.tag_name -or $release.tag_name -notmatch '^v\d+\.\d+\.\d+$') {
+            throw "Invalid Streamline release tag: $($release.tag_name)"
+          }
+
+          $versionText = $release.tag_name -replace '^v', ''
+          $assetName = "streamline-sdk-v$versionText.zip"
+
+          $asset = $release.assets |
+            Where-Object { $_.name -eq $assetName } |
+            Select-Object -First 1
+
+          if (-not $asset) {
+            throw "Asset '$assetName' was not found in release '$($release.tag_name)'."
+          }
+
+          Write-Output "Latest Streamline release: $($release.tag_name)"
+          Write-Output "Downloading asset: $assetName"
+
+          $zipPath = Join-Path $downloadDir $assetName
+
+          Invoke-WebRequest `
+            -Uri $asset.browser_download_url `
+            -Headers $headers `
+            -OutFile $zipPath
+
+          if (-not (Test-Path $zipPath) -or (Get-Item $zipPath).Length -eq 0) {
+            throw "Streamline SDK download failed or produced an empty file."
+          }
+
+          if (Test-Path $extractDir) {
+            Remove-Item -LiteralPath $extractDir -Recurse -Force
+          }
+
+          New-Item -ItemType Directory -Path $extractDir -Force | Out-Null
+
+          Expand-Archive `
+            -LiteralPath $zipPath `
+            -DestinationPath $extractDir `
+            -Force
+
+          # Locate bin\x64 and collect DLL files only.
+          $binDirs = @(
+            Get-ChildItem -Path $extractDir -Directory -Recurse |
+              Where-Object {
+                $_.Name -eq "x64" -and $_.Parent.Name -eq "bin"
+              }
+          )
+
+          if ($binDirs.Count -eq 0) {
+            throw "No bin\x64 directory was found in the Streamline SDK archive."
+          }
+
+          $dllFiles = @(
+            foreach ($binDir in $binDirs) {
+              Get-ChildItem `
+                -LiteralPath $binDir.FullName `
+                -File `
+                -Filter "*.dll"
+            }
+          )
+
+          if ($dllFiles.Count -eq 0) {
+            throw "No DLL files were found in Streamline bin\x64."
+          }
+
+          $duplicateNames = @(
+            $dllFiles |
+              Group-Object -Property Name |
+              Where-Object { $_.Count -gt 1 }
+          )
+
+          if ($duplicateNames.Count -gt 0) {
+            throw "Duplicate DLL filenames were found in the SDK archive."
+          }
+
+          # Replace the entire destination directory.
+          if (Test-Path $destDir) {
+            Remove-Item -LiteralPath $destDir -Recurse -Force
+          }
+
+          New-Item -ItemType Directory -Path $destDir -Force | Out-Null
+
+          foreach ($dll in $dllFiles) {
+            Copy-Item `
+              -LiteralPath $dll.FullName `
+              -Destination $destDir `
+              -Force
+
+            Write-Output "Bundled: $($dll.Name)"
+          }
+
+          $bundledFiles = @(Get-ChildItem -LiteralPath $destDir -File)
+
+          if ($bundledFiles.Count -ne $dllFiles.Count) {
+            throw "The bundled file count does not match the expected DLL count."
+          }
+
+          if (@($bundledFiles | Where-Object { $_.Extension -ne ".dll" }).Count -gt 0) {
+            throw "Unexpected non-DLL files were found in the destination."
+          }
+
+          "version=$versionText" |
+            Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+          Write-Output "Streamline version: $versionText"
+          Write-Output "Bundled DLL count: $($bundledFiles.Count)"
+          Write-Output "Destination: $destDir"
+
+        continue-on-error: false
+
+      - name: Compress the artifact
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $workspace = $env:GITHUB_WORKSPACE
+          $sourceDir = Join-Path $workspace "x64\Release\a"
+          $batchFile = Join-Path $workspace "Streamlined_fetcher_windows.bat"
+
+          if (-not (Test-Path $batchFile)) {
+            throw "Streamlined_fetcher_windows.bat was not found."
+          }
+
+          Copy-Item -LiteralPath $batchFile -Destination (Join-Path $sourceDir "OptiScaler") -Force
+
+          $zipName = "${{ steps.get_version.outputs.filename }}.7z"
+          $archivePath = Join-Path $workspace $zipName
+
+          7z a -r $archivePath (Join-Path $sourceDir "*")
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "7-Zip failed with exit code $LASTEXITCODE."
+          }
+
+          Write-Output "Created archive: $archivePath"
+
+        continue-on-error: false
+
+      - name: Generate Changelog
+        id: commit_messages
+        working-directory: ${{ github.workspace }}
+        shell: powershell
+        run: |
+          Write-Output "Fetching commits from the last 24 hours..."
+
+          $fieldSep = [char]0x1F
+          $recordSep = [char]0x1E
+
+          $format = "%h${fieldSep}%H${fieldSep}%s${fieldSep}%b${fieldSep}%an${recordSep}"
+
+          $rawLogLines = git log `
+            --since="1 day ago" `
+            --no-merges `
+            --first-parent `
+            --pretty=format:"$format"
+
+          $rawLog = ($rawLogLines -join "`n")
+
+          if (-not $rawLog) {
+            $releaseNotes = "No changes in the last 24 hours."
+          } else {
+            $records = $rawLog -split [regex]::Escape($recordSep) |
+              Where-Object { $_.Trim() -ne "" }
+
+            $formattedCommits = foreach ($record in $records) {
+              $parts = $record -split [regex]::Escape($fieldSep)
+
+              if ($parts.Length -lt 5) {
+                Write-Warning "Skipping malformed commit record: $record"
+                continue
+              }
+
+              $shortHash = $parts[0].Trim()
+              $fullHash = $parts[1].Trim()
+              $subject = $parts[2].Trim()
+              $body = $parts[3].Trim()
+              $author = $parts[4].Trim()
+
+              $entry = "- [$shortHash](https://github.com/optiscaler/OptiScaler/commit/$fullHash) $subject ($author)"
+
+              if ($body) {
+                $bodyLines = $body -split "`n" |
+                  ForEach-Object { "  > $($_.Trim())" }
+
+                $entry += "`n" + ($bodyLines -join "`n")
+              }
+
+              $entry
+            }
+
+            $releaseNotes = "### Changes in the Last 24 Hours`n`n" +
+              ($formattedCommits -join "`n`n")
+          }
+
+          $releaseNotes |
+            Out-File -FilePath release_notes.md -Encoding utf8
+
+      - name: Create Release and Upload Artifact
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.get_version.outputs.release_tag }}
+          name: Nightly Build ${{ steps.get_version.outputs.release_tag }}
+          body_path: release_notes.md
+          files: ${{ github.workspace }}/${{ steps.get_version.outputs.filename }}.7z
+          prerelease: true
+          draft: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
