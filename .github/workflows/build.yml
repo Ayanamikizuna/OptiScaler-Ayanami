@@ -294,6 +294,32 @@ jobs:
 
           Write-Output "Cleanup completed."
 
+      - name: Clean unnecessary files
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $outputDir = Join-Path $env:GITHUB_WORKSPACE "x64\Release\a"
+          $optiscalerDir = Join-Path $outputDir "OptiScaler"
+
+          $targets = @(
+            (Join-Path $outputDir "Licenses"),
+            (Join-Path $outputDir "!! EXTRACT ALL FILES TO GAME FOLDER !!"),
+            (Join-Path $outputDir "setup_linux.sh"),
+            (Join-Path $optiscalerDir "Streamlined_fetcher_windows.bat")
+          )
+
+          foreach ($target in $targets) {
+            if (Test-Path -LiteralPath $target) {
+              Remove-Item -LiteralPath $target -Recurse -Force
+              Write-Output "Removed: $target"
+            } else {
+              Write-Output "Not found, skipping: $target"
+            }
+          }
+
+          Write-Output "Cleanup completed."
+
       - name: Compress the artifact
         shell: powershell
         run: |
