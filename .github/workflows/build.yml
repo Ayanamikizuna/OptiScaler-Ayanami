@@ -129,111 +129,26 @@ jobs:
 
         continue-on-error: false
 
-      - name: Download latest Streamline DLLs
-        id: streamline
+      - name: Bundle Streamline DLLs
         shell: powershell
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $ErrorActionPreference = "Stop"
 
-          $workspace = $env:GITHUB_WORKSPACE
-          $downloadDir = Join-Path $workspace "streamline-download"
-          $extractDir = Join-Path $workspace "streamline-extracted"
-          $destDir = Join-Path $workspace "x64\Release\a\OptiScaler\streamline"
+          $sourceDir = Join-Path $env:GITHUB_WORKSPACE "streamline"
+          $destDir = Join-Path $env:GITHUB_WORKSPACE "x64\Release\a\OptiScaler\streamline"
 
-          $headers = @{
-            "User-Agent" = "OptiScaler-Nightly-Build"
-            "Accept" = "application/vnd.github+json"
-          }
-
-          if ($env:GITHUB_TOKEN) {
-            $headers["Authorization"] = "Bearer $env:GITHUB_TOKEN"
-          }
-
-          New-Item -ItemType Directory -Path $downloadDir -Force | Out-Null
-
-          # Get the latest published stable release.
-          $release = Invoke-RestMethod `
-            -Uri "https://api.github.com/repos/NVIDIA-RTX/Streamline/releases/latest" `
-            -Headers $headers
-
-          if (-not $release.tag_name -or $release.tag_name -notmatch '^v\d+\.\d+\.\d+$') {
-            throw "Invalid Streamline release tag: $($release.tag_name)"
-          }
-
-          $versionText = $release.tag_name -replace '^v', ''
-          $assetName = "streamline-sdk-v$versionText.zip"
-
-          $asset = $release.assets |
-            Where-Object { $_.name -eq $assetName } |
-            Select-Object -First 1
-
-          if (-not $asset) {
-            throw "Asset '$assetName' was not found in release '$($release.tag_name)'."
-          }
-
-          Write-Output "Latest Streamline release: $($release.tag_name)"
-          Write-Output "Downloading asset: $assetName"
-
-          $zipPath = Join-Path $downloadDir $assetName
-
-          Invoke-WebRequest `
-            -Uri $asset.browser_download_url `
-            -Headers $headers `
-            -OutFile $zipPath
-
-          if (-not (Test-Path $zipPath) -or (Get-Item $zipPath).Length -eq 0) {
-            throw "Streamline SDK download failed or produced an empty file."
-          }
-
-          if (Test-Path $extractDir) {
-            Remove-Item -LiteralPath $extractDir -Recurse -Force
-          }
-
-          New-Item -ItemType Directory -Path $extractDir -Force | Out-Null
-
-          Expand-Archive `
-            -LiteralPath $zipPath `
-            -DestinationPath $extractDir `
-            -Force
-
-          # Locate bin\x64 and collect DLL files only.
-          $binDirs = @(
-            Get-ChildItem -Path $extractDir -Directory -Recurse |
-              Where-Object {
-                $_.Name -eq "x64" -and $_.Parent.Name -eq "bin"
-              }
-          )
-
-          if ($binDirs.Count -eq 0) {
-            throw "No bin\x64 directory was found in the Streamline SDK archive."
+          if (-not (Test-Path $sourceDir)) {
+            throw "Streamline source directory not found: $sourceDir"
           }
 
           $dllFiles = @(
-            foreach ($binDir in $binDirs) {
-              Get-ChildItem `
-                -LiteralPath $binDir.FullName `
-                -File `
-                -Filter "*.dll"
-            }
+            Get-ChildItem -LiteralPath $sourceDir -File -Filter "*.dll"
           )
 
           if ($dllFiles.Count -eq 0) {
-            throw "No DLL files were found in Streamline bin\x64."
+            throw "No Streamline DLL files found in $sourceDir"
           }
 
-          $duplicateNames = @(
-            $dllFiles |
-              Group-Object -Property Name |
-              Where-Object { $_.Count -gt 1 }
-          )
-
-          if ($duplicateNames.Count -gt 0) {
-            throw "Duplicate DLL filenames were found in the SDK archive."
-          }
-
-          # Replace the entire destination directory.
           if (Test-Path $destDir) {
             Remove-Item -LiteralPath $destDir -Recurse -Force
           }
@@ -249,24 +164,35 @@ jobs:
             Write-Output "Bundled: $($dll.Name)"
           }
 
-          $bundledFiles = @(Get-ChildItem -LiteralPath $destDir -File)
-
-          if ($bundledFiles.Count -ne $dllFiles.Count) {
-            throw "The bundled file count does not match the expected DLL count."
-          }
-
-          if (@($bundledFiles | Where-Object { $_.Extension -ne ".dll" }).Count -gt 0) {
-            throw "Unexpected non-DLL files were found in the destination."
-          }
-
-          "version=$versionText" |
-            Out-File -FilePath $env:GITHUB_OUTPUT -Append
-
-          Write-Output "Streamline version: $versionText"
-          Write-Output "Bundled DLL count: $($bundledFiles.Count)"
-          Write-Output "Destination: $destDir"
+          Write-Output "Bundled $($dllFiles.Count) Streamline DLL files."
 
         continue-on-error: false
+
+      - name: Clean unnecessary files
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $outputDir = Join-Path $env:GITHUB_WORKSPACE "x64\Release\a"
+          $optiscalerDir = Join-Path $outputDir "OptiScaler"
+
+          $targets = @(
+            (Join-Path $outputDir "Licenses"),
+            (Join-Path $outputDir "!! EXTRACT ALL FILES TO GAME FOLDER !!"),
+            (Join-Path $outputDir "setup_linux.sh"),
+            (Join-Path $optiscalerDir "Streamlined_fetcher_windows.bat")
+          )
+
+          foreach ($target in $targets) {
+            if (Test-Path -LiteralPath $target) {
+              Remove-Item -LiteralPath $target -Recurse -Force
+              Write-Output "Removed: $target"
+            } else {
+              Write-Output "Not found, skipping: $target"
+            }
+          }
+
+          Write-Output "Cleanup completed."
 
       - name: Compress the artifact
         shell: powershell
@@ -296,28 +222,85 @@ jobs:
 
         continue-on-error: false
 
+
       - name: Generate Changelog
         id: commit_messages
         working-directory: ${{ github.workspace }}
         shell: powershell
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_RUN_STARTED_AT: ${{ github.run_started_at }}
         run: |
-          Write-Output "Fetching commits from the last 24 hours..."
+          $ErrorActionPreference = "Stop"
 
+          # 获取本次构建开始时间（UTC）
+          $buildTime = [DateTimeOffset]::Parse(
+            $env:GITHUB_RUN_STARTED_AT
+          ).ToUniversalTime()
+
+          # 获取上一次成功发布的 Nightly Release
+          Write-Output "Fetching previous Nightly Release..."
+
+          $releases = gh release list `
+            --repo $env:GITHUB_REPOSITORY `
+            --limit 100 `
+            --json tagName,publishedAt |
+            ConvertFrom-Json
+
+          $previousRelease = $releases |
+            Where-Object {
+              $_.tagName -like "nightly-*" -and $_.publishedAt
+            } |
+            Sort-Object {
+              [DateTimeOffset]::Parse($_.publishedAt)
+            } -Descending |
+            Select-Object -First 1
+
+          if ($previousRelease) {
+            $startTime = [DateTimeOffset]::Parse(
+              $previousRelease.publishedAt
+            ).ToUniversalTime()
+
+            Write-Output "Previous Release: $($previousRelease.tagName)"
+          } else {
+            # 首次运行：回溯 7 天
+            $startTime = $buildTime.AddDays(-7)
+
+            Write-Output "No previous Nightly Release found."
+            Write-Output "Using a 7-day fallback window."
+          }
+
+          if ($startTime -ge $buildTime) {
+            throw "Invalid Changelog time range."
+          }
+
+          $startGit = $startTime.ToString("yyyy-MM-ddTHH:mm:ssZ")
+          $endGit = $buildTime.ToString("yyyy-MM-ddTHH:mm:ssZ")
+
+          Write-Output "Changelog Start: $startGit"
+          Write-Output "Changelog End: $endGit"
+
+          # 获取时间范围内的提交
           $fieldSep = [char]0x1F
           $recordSep = [char]0x1E
 
           $format = "%h${fieldSep}%H${fieldSep}%s${fieldSep}%b${fieldSep}%an${recordSep}"
 
           $rawLogLines = git log `
-            --since="1 day ago" `
+            "--since=$startGit" `
+            "--until=$endGit" `
             --no-merges `
             --first-parent `
-            --pretty=format:"$format"
+            "--pretty=format:$format"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to retrieve Git commit history."
+          }
 
           $rawLog = ($rawLogLines -join "`n")
 
           if (-not $rawLog) {
-            $releaseNotes = "No changes in the last 24 hours."
+            $releaseNotes = "No changes during this build period."
           } else {
             $records = $rawLog -split [regex]::Escape($recordSep) |
               Where-Object { $_.Trim() -ne "" }
@@ -348,12 +331,18 @@ jobs:
               $entry
             }
 
-            $releaseNotes = "### Changes in the Last 24 Hours`n`n" +
-              ($formattedCommits -join "`n`n")
+            if ($formattedCommits) {
+              $releaseNotes = "### Changes in Build Period`n`n" +
+                ($formattedCommits -join "`n`n")
+            } else {
+              $releaseNotes = "No changes during this build period."
+            }
           }
 
           $releaseNotes |
             Out-File -FilePath release_notes.md -Encoding utf8
+
+          Write-Output "Changelog generated successfully."
 
       - name: Create Release and Upload Artifact
         uses: softprops/action-gh-release@v2
