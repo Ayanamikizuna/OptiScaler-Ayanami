@@ -338,6 +338,15 @@ jobs:
           $zipName = "${{ steps.get_version.outputs.filename }}.7z"
           $archivePath = Join-Path $workspace $zipName
 
+          $batchFileInArtifact = Join-Path $sourceDir "OptiScaler\Streamlined_fetcher_windows.bat"
+
+          if (Test-Path -LiteralPath $batchFileInArtifact) {
+            Remove-Item -LiteralPath $batchFileInArtifact -Force
+            Write-Output "Removed: $batchFileInArtifact"
+          } else {
+            Write-Output "File not found, skipping: $batchFileInArtifact"
+          }
+
           7z a -r $archivePath (Join-Path $sourceDir "*")
 
           if ($LASTEXITCODE -ne 0) {
